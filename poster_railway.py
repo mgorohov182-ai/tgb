@@ -2,7 +2,7 @@ import asyncio
 import os
 from datetime import datetime
 from pyrogram import Client
-from pyrogram.errors import FloodWait, RPCError, PeerIdInvalid, ChatWriteForbidden, ChatIdInvalid
+from pyrogram.errors import FloodWait, RPCError, PeerIdInvalid, ChatWriteForbidden, ChatIdInvalid, ChannelInvalid
 import time
 
 # ===== НАСТРОЙКИ =====
@@ -43,24 +43,19 @@ def normalize_chat_id(raw_id):
     Возвращает список целых чисел (кандидатов).
     """
     candidates = []
-    # Убираем лишние пробелы и преобразуем в строку
     raw = str(raw_id).strip()
-    # Пытаемся интерпретировать как целое число
     try:
         int_id = int(raw)
         candidates.append(int_id)
-        # Если это отрицательное число без префикса -100, добавим вариант с -100
-        if int_id < 0 and str(int_id).startswith('-') and not str(int_id).startswith('-100'):
-            # Возможно, это старая группа, нужно добавить -100
+        # Если отрицательное и не начинается с -100, добавим вариант с -100
+        if int_id < 0 and not raw.startswith('-100'):
             candidates.append(int(f"-100{abs(int_id)}"))
-        # Если начинается с -100, попробуем убрать -100 (для старых групп)
-        if str(int_id).startswith('-100'):
-            # Убираем -100, оставляем остаток
-            rest = str(int_id)[4:]  # после -100
+        # Если начинается с -100, добавим вариант без префикса
+        if raw.startswith('-100'):
+            rest = raw[4:]  # после -100
             if rest.lstrip('-').isdigit():
                 candidates.append(int(rest))
     except ValueError:
-        # Если не число, может быть строкой вида "t.me/joinchat/..." – не поддерживается
         pass
     # Убираем дубликаты, сохраняя порядок
     seen = set()
@@ -81,51 +76,48 @@ async def send_to_all_groups(app):
     print(f"\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Начинаю рассылку...")
 
     for raw_id in groups:
-        # Пробуем разные варианты ID
         candidates = normalize_chat_id(raw_id)
         if not candidates:
             print(f"❌ Не удалось распознать ID: {raw_id} — пропускаем")
             continue
 
         sent = False
+        last_error = None
         for chat_id in candidates:
             try:
-                # Сначала проверим существование чата и права
-                chat = await app.get_chat(chat_id)
-                # Если чат получен, отправляем сообщение
+                # Пытаемся отправить сообщение напрямую
                 await app.send_message(chat_id, message)
                 print(f"✅ Отправлено в {chat_id} (из исходного '{raw_id}')")
                 sent = True
-                break  # удалось отправить, выходим из цикла кандидатов
-            except PeerIdInvalid:
-                # Неверный ID — пробуем следующий кандидат
-                continue
-            except ChatIdInvalid:
-                continue
-            except ChatWriteForbidden:
-                print(f"❌ Нет прав на отправку в {chat_id} (исходный '{raw_id}') — пропускаем группу")
-                # Можно выйти из цикла кандидатов, т.к. права не зависят от формата ID
                 break
+            except (PeerIdInvalid, ChatIdInvalid, ChannelInvalid) as e:
+                # Неверный ID — пробуем следующий кандидат
+                last_error = e
+                continue
+            except ChatWriteForbidden as e:
+                print(f"❌ Нет прав на отправку в {chat_id} (исходный '{raw_id}') — пропускаем группу")
+                last_error = e
+                break  # права не зависят от формата ID, дальше пробовать бесполезно
             except FloodWait as e:
                 print(f"⚠️ Флуд-контроль: нужно подождать {e.value} секунд")
                 await asyncio.sleep(e.value)
-                # После ожидания можно повторить попытку с тем же кандидатом? Но чтобы не усложнять, просто выйдем из цикла и продолжим следующую группу позже.
-                # Так как мы внутри цикла по группам, лучше подождать и затем повторить эту же группу? Но тогда может быть бесконечно.
-                # Просто ждём и продолжаем текущую группу? Сейчас мы просто ждём и затем пытаемся следующего кандидата.
-                # На самом деле после ожидания можно повторить отправку в тот же чат, но для простоты пропустим эту группу на этом цикле.
-                break
+                # После ожидания пробуем следующий кандидат (или можно повторить этот же, но для простоты идём дальше)
+                continue
             except RPCError as e:
-                print(f"❌ Ошибка RPC при отправке в {chat_id}: {e}")
-                # Если ошибка, возможно, стоит попробовать другой кандидат
+                # Другие RPC ошибки — пробуем другой кандидат
+                last_error = e
                 continue
             except Exception as e:
+                # Непредвиденная ошибка
                 print(f"❌ Неизвестная ошибка для {chat_id}: {e}")
+                last_error = e
                 continue
 
         if not sent:
-            print(f"❌ Не удалось отправить сообщение в группу с исходным ID '{raw_id}' — ни один кандидат не подошёл")
+            error_info = f": {last_error}" if last_error else ""
+            print(f"❌ Не удалось отправить сообщение в группу с исходным ID '{raw_id}' — ни один кандидат не подошёл{error_info}")
 
-        # Небольшая задержка между группами, чтобы не вызвать флуд
+        # Небольшая задержка между группами
         await asyncio.sleep(5)
 
     print("✅ Рассылка завершена")
